@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..llm import make_llm
 from ..state import ThreatState
 from ..tools.html_analysis import analyze_html
 from ..tools.safe_browsing import check_url_safe_browsing
 from ..tools.urlscan import urlscan_submit
+from ._parse_utils import confidence_to_severity, parse_classification, truncate_at_word
 
 _HTML_INDICATOR_SIGNALS: dict[str, tuple[str, str]] = {
     "login_form_offsite":  ("high",   "html_credential_harvest"),
@@ -76,6 +78,9 @@ URL(s): {urls}
 HTML INDICATORS:
 {html_summary}
 
+URLSCAN RESULTS:
+{urlscan_summary}
+
 VISIBLE TEXT:
 {visible_text}
 """
@@ -85,50 +90,41 @@ def _build_prompt(text: str, urls: list[str], url_results: list[dict]) -> str:
     urls_str = "\n".join(urls) if urls else "(none found)"
 
     html_parts: list[str] = []
+    urlscan_parts: list[str] = []
     for entry in url_results:
         u = entry["url"]
         hr = entry.get("html_analysis") or {}
         if not hr.get("analyzed"):
             html_parts.append(f"  {u}: fetch failed ({hr.get('reason', 'unknown')})")
-            continue
-        fetch = hr.get("fetch", {})
-        inds = hr.get("indicators", {})
-        found = [k for k, v in inds.items() if v.get("found")]
-        ssl_status = "valid" if fetch.get("ssl_valid") else f"INVALID ({fetch.get('ssl_error','')})"
-        redirects = len(fetch.get("redirect_chain", []))
-        html_parts.append(
-            f"  {u}:\n"
-            f"    SSL: {ssl_status} | redirects: {redirects} | "
-            f"final_url: {fetch.get('final_url', u)}\n"
-            f"    Indicators found: {found if found else 'none'}"
-        )
+        else:
+            fetch = hr.get("fetch", {})
+            inds = hr.get("indicators", {})
+            found = [k for k, v in inds.items() if v.get("found")]
+            ssl_status = "valid" if fetch.get("ssl_valid") else f"INVALID ({fetch.get('ssl_error','')})"
+            redirects = len(fetch.get("redirect_chain", []))
+            html_parts.append(
+                f"  {u}:\n"
+                f"    SSL: {ssl_status} | redirects: {redirects} | "
+                f"final_url: {fetch.get('final_url', u)}\n"
+                f"    Indicators found: {found if found else 'none'}"
+            )
+        us = entry.get("urlscan") or {}
+        if us.get("submitted"):
+            resp = us.get("response") or {}
+            scan_url = resp.get("result") or resp.get("api") or "(pending)"
+            urlscan_parts.append(f"  {u}: submitted — result at {scan_url}")
+        else:
+            urlscan_parts.append(f"  {u}: not submitted ({us.get('reason', us.get('error', 'unknown'))})")
 
     html_summary = "\n".join(html_parts) if html_parts else "  (no URLs fetched)"
+    urlscan_summary = "\n".join(urlscan_parts) if urlscan_parts else "  (no URLs scanned)"
 
     return _PROMPT_TEMPLATE.format(
         urls=urls_str,
         html_summary=html_summary,
-        visible_text=text[:2000],
+        urlscan_summary=urlscan_summary,
+        visible_text=truncate_at_word(text, 2000),
     )
-
-
-def _parse_classification(response: str) -> tuple[str, str]:
-    """Extract CLASSIFICATION and CONFIDENCE lines from the LLM response."""
-    classification = "UNKNOWN"
-    confidence = "Low"
-    for line in response.splitlines():
-        line = line.strip()
-        if line.upper().startswith("CLASSIFICATION:"):
-            val = line.split(":", 1)[1].strip().upper()
-            if "PHISHING" in val:
-                classification = "PHISHING"
-            elif "LEGITIMATE" in val:
-                classification = "LEGITIMATE"
-        elif line.upper().startswith("CONFIDENCE:"):
-            val = line.split(":", 1)[1].strip().capitalize()
-            if val in ("High", "Medium", "Low"):
-                confidence = val
-    return classification, confidence
 
 
 def phishing_agent(state: ThreatState) -> dict:
@@ -136,10 +132,24 @@ def phishing_agent(state: ThreatState) -> dict:
     text = parsed.get("text") or ""
     urls = list(dict.fromkeys(_URL_RE.findall(text)))[:5]
 
+    def _scan_url(u: str) -> dict:
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            f_sb = ex.submit(check_url_safe_browsing.invoke, {"url": u})
+            f_us = ex.submit(urlscan_submit.invoke, {"url": u})
+            f_html = ex.submit(analyze_html.invoke, {"url": u})
+        return {
+            "url": u,
+            "safe_browsing": f_sb.result(),
+            "urlscan": f_us.result(),
+            "html_analysis": f_html.result(),
+        }
+
     signals: list[dict] = []
-    url_results = []
-    for u in urls:
-        sb = check_url_safe_browsing.invoke({"url": u})
+    url_results = [_scan_url(u) for u in urls]
+    for entry in url_results:
+        u = entry["url"]
+        sb = entry["safe_browsing"]
+        html_result = entry["html_analysis"]
         if sb.get("matches"):
             signals.append(
                 {
@@ -149,9 +159,6 @@ def phishing_agent(state: ThreatState) -> dict:
                     "detail": sb["matches"],
                 }
             )
-        us = urlscan_submit.invoke({"url": u})
-        html_result = analyze_html.invoke({"url": u})
-        url_results.append({"url": u, "safe_browsing": sb, "urlscan": us, "html_analysis": html_result})
 
         if html_result.get("analyzed"):
             indicators = html_result.get("indicators", {})
@@ -210,10 +217,9 @@ def phishing_agent(state: ThreatState) -> dict:
     try:
         llm_response = str(llm.invoke(prompt))
         reasoning = llm_response
-        # Parse CLASSIFICATION + CONFIDENCE to emit an LLM-driven signal
-        classification, confidence = _parse_classification(llm_response)
+        classification, confidence = parse_classification(llm_response, "PHISHING")
         if classification == "PHISHING":
-            severity = "high" if confidence == "High" else "medium"
+            severity = confidence_to_severity(confidence)
             signals.append({
                 "source": "phishing",
                 "severity": severity,

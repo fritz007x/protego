@@ -3,6 +3,7 @@ from __future__ import annotations
 from ..data.watsonx_data import get_vendor
 from ..llm import make_llm
 from ..state import ThreatState
+from ._parse_utils import confidence_to_severity, parse_classification
 
 _PROMPT_TEMPLATE = """\
 You are an expert financial fraud analyst specializing in invoice fraud detection. \
@@ -103,23 +104,6 @@ def _build_prompt(
     )
 
 
-def _parse_classification(response: str) -> tuple[str, str]:
-    classification = "UNKNOWN"
-    confidence = "Low"
-    for line in response.splitlines():
-        line = line.strip()
-        if line.upper().startswith("CLASSIFICATION:"):
-            val = line.split(":", 1)[1].strip().upper()
-            if "FRAUDULENT" in val:
-                classification = "FRAUDULENT"
-            elif "LEGITIMATE" in val:
-                classification = "LEGITIMATE"
-        elif line.upper().startswith("CONFIDENCE:"):
-            val = line.split(":", 1)[1].strip().capitalize()
-            if val in ("High", "Medium", "Low"):
-                confidence = val
-    return classification, confidence
-
 
 def invoice_agent(state: ThreatState) -> dict:
     parsed = state.get("parsed") or {}
@@ -141,7 +125,8 @@ def invoice_agent(state: ThreatState) -> dict:
         )
     else:
         stored_bank = (record.get("bank_account") or "").upper()
-        if bank and stored_bank and bank != stored_bank:
+        incoming_bank = (bank or "").upper()
+        if stored_bank and incoming_bank and incoming_bank != stored_bank:
             signals.append(
                 {
                     "source": "invoice",
@@ -171,16 +156,16 @@ def invoice_agent(state: ThreatState) -> dict:
     try:
         llm_response = str(llm.invoke(prompt))
         reasoning = llm_response
-        classification, confidence = _parse_classification(llm_response)
+        classification, confidence = parse_classification(llm_response, "FRAUDULENT")
         if classification == "FRAUDULENT":
-            severity = "high" if confidence == "High" else "medium"
+            severity = confidence_to_severity(confidence)
             signals.append({
                 "source": "invoice",
                 "severity": severity,
                 "reason": "llm_classified_fraudulent",
                 "detail": f"confidence={confidence}",
             })
-    except Exception as e:  # pragma: no cover - defensive for remote API
+    except Exception as e:
         reasoning = f"[llm-error] {e}"
 
     return {"signals": signals, "reasoning": reasoning, "threat_type": "invoice"}
