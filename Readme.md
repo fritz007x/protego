@@ -1,10 +1,10 @@
-# Protego — Cyber Agent
+# Protegonet — Cyber Agent
 
 AI threat defense for small and rural businesses. A multi-agent [LangGraph](https://langchain-ai.github.io/langgraph/) application, deployable on **IBM watsonx.ai**, that ingests email / PDF / invoice content, classifies the threat, runs specialist analysis, scores risk, and takes one of three actions — **Alert / Block / Verify** — with a human-in-the-loop escape hatch for high-risk events.
 
 ## Why
 
-Small businesses are the soft underbelly of the AI-attack era: GenAI-crafted phishing, business-email-compromise (BEC), and invoice fraud now reach the same inboxes that have no SOC, no SIEM, and no threat-intel budget. Protego brings an orchestrated agent pipeline — defense with the same tools the attackers are using — to organizations that can't staff one.
+Small businesses are the soft underbelly of the AI-attack era: GenAI-crafted phishing, business-email-compromise (BEC), and invoice fraud now reach the same inboxes that have no SOC, no SIEM, and no threat-intel budget. Protegonet brings an orchestrated agent pipeline — defense with the same tools the attackers are using — to organizations that can't staff one.
 
 ## Features
 
@@ -154,13 +154,13 @@ All config is loaded from `.env` via `src/cyber_agent/config.py`. Key variables:
 The app is packaged as a FastAPI service and containerized via `Dockerfile` (Python 3.11-slim + Tesseract + Poppler). Recommended runtime: **IBM Cloud Code Engine**, alongside watsonx.ai.
 
 ```bash
-docker build -t protego .
-docker run -p 8000:8000 --env-file .env protego
+docker build -t protegonet .
+docker run -p 8000:8000 --env-file .env protegonet
 
 # Code Engine (example)
-ibmcloud ce application create --name protego \
-  --image <registry>/protego:latest \
-  --env-from-secret protego-env \
+ibmcloud ce application create --name protegonet \
+  --image <registry>/protegonet:latest \
+  --env-from-secret protegonet-env \
   --port 8000
 ```
 
